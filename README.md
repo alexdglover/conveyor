@@ -37,8 +37,8 @@ possible to give referential keys without complicating logic elsewhere.
 
 ## Queue(s)
 
-Conveyor uses queues to make jobs available to one more Runners, while
-ensuring each job is run exactly one time.
+Conveyor uses queues to make jobs available to one or more Runners, while
+ensuring each job is executed exactly one time.
 
 By default, Conveyor uses one queue for all Runners. If you would like to run
 different builds on different Runners (e.g. Runners with GPUs, Runners with
@@ -52,7 +52,7 @@ development and testing, but Redis and SQS will be supported for deployments.
 
 ## Jobs and Belts
 
-Conveyor's primary focus is to provide interoperable, modular Jobs that can be
+Conveyor's primary focus is to provide inter-operable, modular Jobs that can be
 chained together to provide more valuable automation flows. Jobs can execute
 any set of arbitrary commands within the job, but they have resolvable inputs
 and outputs. This allows for artifacts or state to be passed from one Job to
@@ -64,6 +64,21 @@ an entire Belt at once, immediately scheduling any jobs with no dependencies
 and registering the remaining jobs.
 
 This concept of chaining jobs is the main differentiator for Conveyor.
+
+### Job Outputs
+
+In order to separate Orchestrators and Runners, Job Outputs must be generic
+strings. This allows outputs to be used for serialized data (like JSON/YAML),
+file contents (like configuration files), references to external artifacts
+(like S3 objects or Docker images). It is each Job's responsibility to be inter-
+operable with its upstream and downstream Jobs.
+
+For example, the outputs of a BASH Job are `STDOUT` and
+any environment variables set when the session is terminated. In a Docker
+build Job, you could build a new Docker image and set the environment variable
+`DOCKER_IMAGE` to `my_image:my_tag`. The next Job can then consume string as an
+input to create a new Kubernetes pod/ECS service with that image.
+
 
 ## Products
 
@@ -93,15 +108,15 @@ output from one Product into one or more downstream Products. For example, the
 repo for the actualy Ruby on Rails code may have a `.conveyor.yml` like this:
 
 ```yaml
-product: ror-api-backend
+product: rails-backend
 triggers:
   - scm-event:
-    repo: git://github.com/ror-api-backend
+    repo: git://github.com/rails-backend
     type: pull-request
     belts:
       - pull-request-tests
   - scm-event:
-    repo: git://github.com/ror-api-backend
+    repo: git://github.com/rails-backend
     type: merge
     belts:
       - build-gem
@@ -109,7 +124,8 @@ belts:
   - name: pull-request-tests
     jobs:
       - name: rubocop
-        inputs: source
+        inputs:
+          - git:<source_url>
         pre-run: |
           bundle install
         commands: |
@@ -122,19 +138,26 @@ belts:
           bundle exec spec
   - name: build-gem
     jobs:
-      - name: build-gem
-        inputs: source
+      - name: compile-gem
+        inputs:
+          - git:<source_url>
         pre-run: |
           bundle install
         commands: |
           bundle exec rake gem:build
         outputs:
-          - String: GEM_VERSION=$GEM_VERSION
-          - String: PACKER_FILE=ror_ami.json
+          - GEM_VERSION
+      - name: publish-gem
+        pre-run: |
+          bundle install
+        commands: |
+          GEM_VERSION={{compile-gem.GEM_VERSION}} bundle exec rake gem:publish
+        outputs:
+          - GEM_VERSION
         downstreams:
-          - downstream-product: ami
             belts:
-              - build-ror-ami
+              - downstream-product: ami
+                belt: build-rails-backend-ami
 
 ```
 
@@ -151,41 +174,44 @@ Let's look at how we would define our `.conveyor.yml` for the AMI repo:
 product: ami
 triggers: # No triggers required since upstream job will trigger
 belts:
-  - name: build-ror-ami
+  - name: build-ami
     jobs:
       - name: execute-packer
         inputs:
-          - source
-          - ror-api-backend.build-gem # This is implicitly set since it is the trigger
+          - git:<source_url>
+          - rails-backend # Makes the job object available for reference
         commands: |
-          packer build ${ror-api-backend.build-gem.PACKER_FILE}
+          # Explicit Jinja syntax for consuming job outputs is <product>.<belt>.<job>.<output>
+          # Conveyor will also 'flatten' the outputs to the parent; a given output is also
+          # available via <product>.<output>, but be mindful of namespacing if you using
+          # this implied format
+          GEM_VERSION={{rails-backend.build-gem.GEM_VERSION}} packer build rails_backend_packer_file.json
         outputs:
-          - String: AMI_ID
+          - AMI_ID
 ```
 
 Next, your Terraform repo would define it's own Product and Belts in a separate
-`.conveyor.yml` file:
+`.conveyor.yml` file. In this example, we're defining an upstream Job as a
+trigger, as opposed to declaring the `terraform` project as a downstream. In
+other words, bidirectionality is supported. Here's the example:
 
 ```yaml
 product: terraform
 triggers:
   - upstream-build:
     upstream-product: ami
-    upstream-belt: build-gem
-    belts:
-      - build-ror-ami
+    upstream-belt: build-ami
+    build: last # By default, a job will look at the last successful job.
+    # Other `build` options include last_successful, last_failure, and explicit
+    # build numbers
 belts:
-  - name: build-gem
+  - name: update-autoscaling-group
     jobs:
       - name: build-gem
         inputs:
-          - source
-          - ror-api-backend.build-gem
+          - git:<source_url>
+          # - ami # Declaring the ami product as an input is unnecessary since
+          # this job was triggered by an `ami` Belt
         commands: |
-          packer build ${ror-api-backend.build-gem.PACKER_FILE}
-        outputs:
-          - String: AMI_ID
+          TF_VAR_ami_id={{ami.build_ami.ami_id}} terraform apply
 ```
-
-
-Products can also be defined as a totally separate, first class object.you could define a "API Service" product with:
